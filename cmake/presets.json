@@ -1,0 +1,75 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "generator": "Unix Makefiles",
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "CMAKE_C_COMPILER_LAUNCHER": "ccache",
+                "CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
+                "CMAKE_PROJECT_TOP_LEVEL_INCLUDES": { "type": "FILEPATH", "value": "${fileDir}/dev-env.cmake" },
+                "DEV_ENV_PREFIX_MAP": "ON"
+            }
+        },
+        {
+            "name": "native",
+            "hidden": true,
+            "inherits": "base",
+            "cacheVariables": { "DEV_ENV_LINKER": "mold", "DEV_ENV_COMPRESS_DEBUG": "ON", "DEV_ENV_SPLIT_DWARF": "OFF" }
+        },
+        {
+            "name": "debug",
+            "displayName": "Native Debug -> build/DEBUG",
+            "inherits": "native",
+            "binaryDir": "${sourceDir}/build/DEBUG",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_INSTALL_PREFIX": { "type": "PATH", "value": "${sourceDir}/build/DEBUG/dist" }
+            }
+        },
+        {
+            "name": "testing",
+            "displayName": "Native Debug + BUILD_TESTING -> build/TESTING",
+            "inherits": "debug",
+            "binaryDir": "${sourceDir}/build/TESTING",
+            "cacheVariables": {
+                "BUILD_TESTING": "ON",
+                "CMAKE_INSTALL_PREFIX": { "type": "PATH", "value": "${sourceDir}/build/TESTING/dist" }
+            }
+        },
+        {
+            "name": "release",
+            "displayName": "Native Release -> build/RELEASE",
+            "inherits": "native",
+            "binaryDir": "${sourceDir}/build/RELEASE",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_INSTALL_PREFIX": { "type": "PATH", "value": "${sourceDir}/build/RELEASE/dist" }
+            }
+        },
+        {
+            "name": "yocto",
+            "displayName": "Yocto SDK -> build/YOCTO-<sdk>  (activate first with: sdk <name>)",
+            "inherits": "base",
+            "binaryDir": "${sourceDir}/build/YOCTO-$env{DEV_ENV_SDK}",
+            "toolchainFile": "$env{OE_CMAKE_TOOLCHAIN_FILE}",
+            "condition": { "type": "notEquals", "lhs": "$env{DEV_ENV_SDK}", "rhs": "" },
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+                "CMAKE_INSTALL_PREFIX": { "type": "PATH", "value": "${sourceDir}/build/YOCTO-$env{DEV_ENV_SDK}/dist" }
+            }
+        }
+    ],
+    "buildPresets": [
+        { "name": "debug",   "configurePreset": "debug" },
+        { "name": "testing", "configurePreset": "testing" },
+        { "name": "release", "configurePreset": "release" },
+        { "name": "yocto",   "configurePreset": "yocto", "condition": { "type": "notEquals", "lhs": "$env{DEV_ENV_SDK}", "rhs": "" } }
+    ],
+    "testPresets": [
+        { "name": "testing", "configurePreset": "testing", "output": { "outputOnFailure": true } }
+    ]
+}

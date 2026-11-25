@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# wt - git worktrees in a "bare repo container" layout, wired into the dev-env cmake presets.
+#
+#   <container>/            e.g. ~/development/<project>
+#     .bare/                the repository (bare)
+#     .git                  file: "gitdir: ./.bare"  -> git commands work in the container too
+#     main/                 worktree for branch main
+#     <name>/               one worktree per branch, build dir inside: <name>/build
+#
+# Run `wt help` for commands.
+set -euo pipefail
+
+DEV_ENV_DIR="${DEV_ENV_DIR:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}"
+PRESETS_FILE="$DEV_ENV_DIR/cmake/presets.json"
+
+die()  { echo "wt: $*" >&2; exit 1; }
+info() { echo "wt: $*" >&2; }
+
+usage() {
+    cat <<'USAGE'
+usage: wt <command> [args]
+
+  init <url> <dir>           bare-clone <url> into <dir>/.bare and add a worktree for the default branch
+  add <name> [<start>]       add worktree <container>/<name> on branch <name>:
+                               - branch exists locally          -> check it out
+                               - only origin/<name> exists       -> create tracking branch
+                               - otherwise                       -> new branch from <start> (default: origin/<default>)
+  review <pr-number>         detached worktree <container>/pr-<n> at the head of GitHub PR <n>; re-run to update
+  rm <name> [--force]        remove worktree (branch is kept; --force discards local changes)
+  list                       list worktrees of this container
+  fetch                      git fetch --prune in this container
+  setup [<dir>]              (re)wire a checkout into the dev-env presets: CMakeUserPresets.json stub,
+                             compile_commands.json symlink, .dir-locals.el, git excludes. Plain clones too.
+  env [<build-dir>]          print the SDK environment a yocto build dir was configured with
+  root                       print the container directory
+
+Then, inside a worktree:   cmake --preset debug|testing|release && make -C build/<PRESET>
+                           sdk <name> && cmake --preset yocto && make -C build/YOCTO-<name>
+USAGE
+}
+
+# --- helpers ---------------------------------------------------------------
+
+find_root() {
+    local d; d="$(pwd -P)"
+    while [ "$d" != "/" ]; do
+        [ -d "$d/.bare" ] && { echo "$d"; return 0; }
+        d="$(dirname "$d")"
+    done
+    return 1
+}
+
+need_root() {
+    ROOT="$(find_root)" || die "not inside a worktree container (no .bare found upwards from $PWD)"
+}
+
+default_branch() {
+    local ref
+    if ref="$(git -C "$ROOT" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)"; then
+        echo "${ref#origin/}"
+    elif git -C "$ROOT" show-ref --verify --quiet refs/heads/main; then
+        echo main
+    else
+        echo master
+    fi
+}
+
+# --- commands --------------------------------------------------------------
+
+cmd_init() {
+    [ $# -eq 2 ] || die "usage: wt init <url> <dir>"
+    local url="$1" dir="$2"
+    [ -e "$dir" ] && die "$dir already exists"
+    mkdir -p "$dir"
+    dir="$(cd "$dir" && pwd -P)"
+    git clone --bare "$url" "$dir/.bare"
+    echo "gitdir: ./.bare" > "$dir/.git"
+    # a bare clone has no remote-tracking refs; give it the normal refspec
+    git -C "$dir" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+    git -C "$dir" fetch --prune origin
+    git -C "$dir" remote set-head origin --auto >/dev/null
+    ROOT="$dir"
+    local def; def="$(default_branch)"
+    git -C "$ROOT" worktree add "$ROOT/$def" "$def"
+    cmd_setup "$ROOT/$def"
+    # notes next to the code: link ../notes/<container-name> if the notes repo has it
+    local notes="$(dirname "$ROOT")/notes/$(basename "$ROOT")"
+    if [ -d "$notes" ] && [ ! -e "$ROOT/notes" ]; then
+        ln -s "../notes/$(basename "$ROOT")" "$ROOT/notes"
+        info "linked $ROOT/notes -> $notes"
+    fi
+    info "created $ROOT with worktree $def"
+}
+
+cmd_add() {
+    need_root
+    [ $# -ge 1 ] || die "usage: wt add <name> [<start>]"
+    local name="$1" start="${2:-}" path
+    path="$ROOT/$name"
+    [ -e "$path" ] && die "$path already exists"
+    git -C "$ROOT" fetch --prune origin
+    if git -C "$ROOT" show-ref --verify --quiet "refs/heads/$name"; then
+        [ -n "$start" ] && die "branch $name already exists, cannot start it from $start"
+        git -C "$ROOT" worktree add "$path" "$name"
+        if ! git -C "$path" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1 \
+           && git -C "$ROOT" show-ref --verify --quiet "refs/remotes/origin/$name"; then
+            git -C "$path" branch --set-upstream-to="origin/$name"
+        fi
+    elif [ -z "$start" ] && git -C "$ROOT" show-ref --verify --quiet "refs/remotes/origin/$name"; then
+        git -C "$ROOT" worktree add --track -b "$name" "$path" "origin/$name"
+    else
+        start="${start:-origin/$(default_branch)}"
+        git -C "$ROOT" worktree add --no-track -b "$name" "$path" "$start"
+        info "new branch $name from $start (no upstream yet; use 'git push -u origin $name')"
+    fi
+    cmd_setup "$path"
+    info "worktree ready: $path"
+}
+
+cmd_review() {
+    need_root
+    [ $# -eq 1 ] || die "usage: wt review <pr-number>"
+    local pr="$1" path
+    path="$ROOT/pr-$pr"
+    git -C "$ROOT" fetch origin "+refs/pull/$pr/head:refs/remotes/origin/pr/$pr"
+    if [ -d "$path" ]; then
+        git -C "$path" checkout --detach "origin/pr/$pr"
+        info "updated $path to current head of PR #$pr"
+    else
+        git -C "$ROOT" worktree add --detach "$path" "origin/pr/$pr"
+        cmd_setup "$path"
+        info "review worktree ready: $path"
+    fi
+}
+
+cmd_rm() {
+    need_root
+    [ $# -ge 1 ] || die "usage: wt rm <name> [--force]"
+    local name="$1"; shift
+    local path="$ROOT/$name"
+    [ -d "$path" ] || die "$path does not exist"
+    git -C "$ROOT" worktree remove "$@" "$path"
+    git -C "$ROOT" worktree prune
+    info "removed worktree $name (branch kept; delete with: git -C $ROOT branch -d $name)"
+}
+
+cmd_list()  { need_root; git -C "$ROOT" worktree list; }
+cmd_env()   {  # wt env <build-dir>: print the SDK environment saved by the yocto preset, if any
+    local d="${1:-.}"; [ -f "$d/.env" ] && grep -v '^#' "$d/.env" || info "no .env in $d (native build dir or not configured yet)"
+}
+cmd_fetch() { need_root; git -C "$ROOT" fetch --prune origin; }
+cmd_root()  { need_root; echo "$ROOT"; }
+
+cmd_setup() {
+    local wt="${1:-$PWD}"
+    [ -d "$wt" ] || die "$wt is not a directory"
+    local top common
+    top="$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null)" || die "$wt is not inside a git work tree"
+    common="$(git -C "$top" rev-parse --path-format=absolute --git-common-dir)"
+
+    # 1. CMakeUserPresets.json stub that includes the shared presets (edits in dev-env propagate)
+    local stub="$top/CMakeUserPresets.json"
+    local content; content="$(printf '{\n    "version": 6,\n    "include": [ "%s" ]\n}\n' "$PRESETS_FILE")"
+    if git -C "$top" ls-files --error-unmatch CMakeUserPresets.json >/dev/null 2>&1; then
+        info "WARNING: $stub is tracked by the repo, not touching it"
+    elif [ -e "$stub" ] && [ "$(cat "$stub")" != "$content" ]; then
+        info "WARNING: $stub exists with foreign content, not touching it"
+    else
+        printf '%s' "$content" > "$stub"
+    fi
+
+    # 2. compile_commands.json for Emacs lsp / clangd (dangling until the debug preset is configured)
+    [ -e "$top/compile_commands.json" ] && [ ! -L "$top/compile_commands.json" ] \
+        || ln -sfn build/DEBUG/compile_commands.json "$top/compile_commands.json"
+
+    # 3. Emacs: per-worktree default build dir for helm-make (dev-env/emacs/jchh-dev-env.el
+    #    rewrites this file when you pick another build dir). Never touches a foreign file.
+    local dl="$top/.dir-locals.el"
+    if git -C "$top" ls-files --error-unmatch .dir-locals.el >/dev/null 2>&1; then
+        info "WARNING: $dl is tracked by the repo, not touching it"
+    elif [ -e "$dl" ] && ! grep -q 'managed by dev-env' "$dl"; then
+        info "WARNING: $dl exists with foreign content, not touching it"
+    elif [ ! -e "$dl" ]; then
+        printf ';;; Directory Local Variables -- managed by dev-env (wt setup / jchh-dev-env-select-build-dir)\n((nil . ((helm-make-build-dir . "build/DEBUG"))))\n' > "$dl"
+    fi
+
+    # 4. hide generated files from git status in every worktree of this repo (info/exclude is shared)
+    mkdir -p "$common/info"
+    touch "$common/info/exclude"
+    local p
+    for p in /CMakeUserPresets.json /compile_commands.json /.dir-locals.el /build/; do
+        grep -qxF -- "$p" "$common/info/exclude" || echo "$p" >> "$common/info/exclude"
+    done
+    info "setup done in $top"
+}
+
+# --- main --------------------------------------------------------------------
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+    init|add|review|rm|list|fetch|setup|root|env) "cmd_$cmd" "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; exit 1 ;;
+esac

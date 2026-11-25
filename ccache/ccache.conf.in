@@ -1,0 +1,23 @@
+# Machine-independent part of the ccache configuration. dev-env/install.sh writes
+# ~/.config/ccache/ccache.conf from the local settings (cache_dir, max_size, base_dir; see
+# shell/config.sh) followed by this file. See dev-env/README.md, section "ccache".
+
+# base_dir (generated above this part) rewrites absolute paths below it to paths relative to
+# the build dir before hashing, so identical sources in different worktrees share entries.
+# Only the worktrees may live below base_dir: anything referenced from every worktree
+# (CPM_SOURCE_CACHE, SDK sysroots) must stay OUTSIDE it, otherwise its relative path depends
+# on how deep the worktree is nested (main/ vs feat/xyz/) and the hashes differ.
+# Do not put the current working directory into the hash.
+hash_dir = false
+
+# include_file_mtime/ctime: keep direct mode working on freshly checked-out or edited files.
+# time_macros: ignore __DATE__/__TIME__ (not used for anything meaningful here).
+# pch_defines / locale: harmless, standard recommendations.
+sloppiness = include_file_mtime,include_file_ctime,time_macros,pch_defines,locale
+
+# Identify the compiler by content, not mtime. Survives package upgrades and works with
+# several toolchains (native gcc/clang, Yocto SDKs) side by side.
+compiler_check = content
+
+# Use the compiler's -MD depfile instead of running the preprocessor on a cache hit.
+depend_mode = true

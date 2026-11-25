@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Wire a plain checkout (not necessarily a worktree) into the dev-env presets.
+exec "$(dirname "$(readlink -f "$0")")/wt" setup "$@"
